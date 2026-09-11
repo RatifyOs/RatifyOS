@@ -1,0 +1,145 @@
+export function registerTradingApi(app, c) {
+    // Routes accept the documented scope plus any legacy alias that older
+    // deployments may already have granted.
+    const denied = (q, r, ...scopes) => {
+        const principal = c.principal(q);
+        if (principal.authenticated === false) {
+            r.code(401).send({
+                error: { code: "UNAUTHORIZED", message: "Authentication required" },
+            });
+            return true;
+        }
+        if (!scopes.some((scope) => principal.scopes.includes(scope))) {
+            r.code(403).send({
+                error: { code: "FORBIDDEN", message: `Missing ${scopes[0]}` },
+            });
+            return true;
+        }
+        return false;
+    }, key = (q, r) => {
+        const k = String(q.headers["idempotency-key"] ?? "");
+        if (!k)
+            r.code(400).send({ error: { code: "IDEMPOTENCY_KEY_REQUIRED" } });
+        return k;
+    };
+    app.post("/v1/trading/quote", async (q, r) => {
+        if (denied(q, r, "trading:quote"))
+            return;
+        const b = q.body ?? {};
+        try {
+            return await c.trading.quote({ ...b, amountIn: BigInt(b.amountIn) });
+        }
+        catch (e) {
+            return r.code(400).send({
+                error: {
+                    code: "INVALID_INTENT",
+                    message: e instanceof Error ? e.message : "invalid",
+                },
+            });
+        }
+    });
+    app.post("/v1/trading/execute", async (q, r) => {
+        if (denied(q, r, "trading:execute"))
+            return;
+        const k = key(q, r);
+        if (!k)
+            return;
+        try {
+            return r.code(202).send(await c.trading.execute(q.body.quoteId, {
+                idempotencyKey: k,
+                actor: c.principal(q).subject,
+                dryRun: q.body.dryRun ?? true,
+            }));
+        }
+        catch (e) {
+            return r.code(409).send({
+                error: {
+                    code: "EXECUTION_REJECTED",
+                    message: e instanceof Error ? e.message : "rejected",
+                },
+            });
+        }
+    });
+    app.post("/v1/trading/executions/:id/approve", async (q, r) => {
+        if (denied(q, r, "trading:approve"))
+            return;
+        if (!key(q, r))
+            return;
+        try {
+            const b = q.body ?? {};
+            c.trading.approve(q.params.id, c.principal(q).subject, {
+                decision: b.decision,
+                challenge: b.challenge,
+                nonce: b.nonce,
+                expectedRevision: b.expectedRevision,
+                timestamp: b.timestamp,
+                proof: b.proof,
+                reason: b.reason,
+            });
+            return r.code(202).send(c.trading.refreshApproval(q.params.id));
+        }
+        catch (e) {
+            return r.code(409).send({
+                error: {
+                    code: "APPROVAL_REJECTED",
+                    message: e instanceof Error ? e.message : "rejected",
+                },
+            });
+        }
+    });
+    app.post("/v1/trading/revoke", async (q, r) => {
+        if (denied(q, r, "trading:execute"))
+            return;
+        const k = key(q, r);
+        if (!k)
+            return;
+        try {
+            return r.code(202).send(await c.trading.revoke(q.body?.tokenAccount, {
+                idempotencyKey: k,
+                actor: c.principal(q).subject,
+                dryRun: q.body?.dryRun ?? true,
+            }));
+        }
+        catch (e) {
+            return r.code(409).send({
+                error: {
+                    code: "REVOKE_REJECTED",
+                    message: e instanceof Error ? e.message : "rejected",
+                },
+            });
+        }
+    });
+    app.post("/v1/trading/executions/:id/submit", async (q, r) => {
+        if (denied(q, r, "trading:submit", "trading:execute"))
+            return;
+        if (!key(q, r))
+            return;
+        try {
+            return r.code(202).send(await c.trading.submit(q.params.id));
+        }
+        catch (e) {
+            return r.code(409).send({
+                error: {
+                    code: "SUBMIT_REJECTED",
+                    message: e instanceof Error ? e.message : "rejected",
+                },
+            });
+        }
+    });
+    app.post("/v1/trading/reconcile", async (q, r) => {
+        if (denied(q, r, "trading:reconcile"))
+            return;
+        return r.code(202).send(await c.trading.recoverAndReconcile());
+    });
+    app.get("/v1/trading/executions/:id", async (q, r) => {
+        if (denied(q, r, "trading:read", "trading:quote"))
+            return;
+        try {
+            return c.trading.status(q.params.id);
+        }
+        catch {
+            return r.code(404).send({ error: { code: "NOT_FOUND" } });
+        }
+    });
+    return app;
+}

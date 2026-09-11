@@ -1,0 +1,309 @@
+#!/usr/bin/env node
+import Fastify from "fastify";
+import { pathToFileURL } from "node:url";
+import { createHash, timingSafeEqual, randomUUID } from "node:crypto";
+import { readdir } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
+import { loadConfig } from "./config/index.js";
+import { createApplication } from "./app/index.js";
+import { llmProviderId } from "./app/adapters.js";
+import { SessionStore } from "./storage/session-store.js";
+import { TRADING_CAPABILITIES } from "./agent/types.js";
+import { registerTradingApi } from "./live-trading/api.js";
+import { registerControlPlane } from "./control/index.js";
+export function createServer(o) {
+    const app = Fastify({ logger: false, bodyLimit: 1_048_576 });
+    const version = o.version ?? process.env.npm_package_version ?? "0.0.0", build = o.build ?? process.env.RAOS_BUILD_SHA ?? "unknown";
+    app.get("/livez", async () => ({ status: "ok" }));
+    app.get("/readyz", async (_q, r) => {
+        const ready = await o.ready();
+        return r.code(ready ? 200 : 503).send({
+            status: ready ? "ready" : "not-ready",
+            dependencies: await o.health(),
+        });
+    });
+    app.get("/metrics", async (_q, r) => r.type("text/plain").send(`raos_ready ${(await o.ready()) ? 1 : 0}\n`));
+    app.get("/version", async () => ({
+        name: "robinhood-agent-os",
+        version,
+        build,
+        node: process.version,
+        signing: o.signing ?? false,
+    }));
+    app.get("/openapi.json", async () => ({
+        openapi: "3.1.0",
+        info: { title: "RatifyOS", version },
+        paths: {},
+    }));
+    app.get("/v1/health", async () => ({
+        status: (await o.ready()) ? "ok" : "degraded",
+        dependencies: await o.health(),
+        signing: o.signing ?? false,
+    }));
+    if (o.resources?.sessions)
+        app.get("/v1/sessions", async (q, r) => {
+            if (o.apiToken && q.headers.authorization !== `Bearer ${o.apiToken}`)
+                return r.code(401).send({
+                    error: { code: "UNAUTHORIZED", message: "Authentication required" },
+                });
+            return o.resources.sessions();
+        });
+    return app;
+}
+export async function createStandaloneServer(config, overrides = {}) {
+    const application = createApplication(config, overrides);
+    await application.start();
+    const app = createServer({
+        ready: () => application.ready(),
+        health: async () => application.health(),
+        signing: config.execution === "live" && !!config.trading?.signerSocketPath,
+    });
+    const auth = (v) => {
+        const token = String(v ?? "").replace(/^Bearer /, "");
+        const expected = config.auth.bearerTokenSha256 ??
+            (config.auth.bearerToken
+                ? createHash("sha256").update(config.auth.bearerToken).digest("hex")
+                : undefined);
+        if (!expected || !String(v).startsWith("Bearer "))
+            return false;
+        const a = Buffer.from(createHash("sha256").update(token).digest("hex"), "hex"), b = Buffer.from(expected, "hex");
+        return a.length === b.length && timingSafeEqual(a, b);
+    };
+    const guard = (q, r, s) => auth(q.headers.authorization)
+        ? config.auth.scopes.includes(s) ||
+            config.auth.scopes.includes("agent:admin")
+            ? true
+            : (r
+                .code(403)
+                .send({ error: { code: "FORBIDDEN", message: "Missing scope" } }),
+                false)
+        : (r.code(401).send({
+            error: { code: "UNAUTHORIZED", message: "Authentication required" },
+        }),
+            false);
+    if (application.trading)
+        registerTradingApi(app, {
+            trading: application.trading,
+            principal: (q) => {
+                const authenticated = auth(q.headers.authorization);
+                return {
+                    subject: config.auth.tenantId,
+                    scopes: authenticated ? [...config.auth.scopes] : [],
+                    authenticated,
+                };
+            },
+        });
+    app.get("/v1/tools", async (q, r) => guard(q, r, "tool:read")
+        ? {
+            items: application.registry.schemas({
+                capabilities: [TRADING_CAPABILITIES.MARKET_DATA],
+            }),
+        }
+        : undefined);
+    app.post("/v1/tools/:name/invoke", async (q, r) => {
+        if (!guard(q, r, "tool:invoke"))
+            return;
+        const name = String(q.params.name);
+        if (!name.startsWith("market."))
+            return r.code(403).send({
+                error: {
+                    code: "CAPABILITY_DENIED",
+                    message: "Only market tools may be invoked",
+                },
+            });
+        const result = await application.registry.invoke(name, q.body ?? {}, {
+            capabilities: [TRADING_CAPABILITIES.MARKET_DATA],
+            invocationId: randomUUID(),
+        });
+        return r
+            .code(!result.ok && result.error.code === "UNAVAILABLE" ? 503 : 200)
+            .send(result);
+    });
+    app.get("/v1/sessions", async (q, r) => {
+        if (!guard(q, r, "agent:read"))
+            return;
+        const store = new SessionStore(config.paths.sessions);
+        try {
+            return { items: store.listUnfinishedRuns() };
+        }
+        finally {
+            store.close();
+        }
+    });
+    app.get("/v1/skills", async (q, r) => {
+        if (!guard(q, r, "tool:read"))
+            return;
+        try {
+            return {
+                items: (await readdir(config.paths.skills, { withFileTypes: true }))
+                    .filter((x) => x.isDirectory() || x.isFile())
+                    .map((x) => x.name),
+            };
+        }
+        catch {
+            return { items: [] };
+        }
+    });
+    app.get("/v1/markets", async (q, r) => {
+        if (!guard(q, r, "tool:read"))
+            return;
+        return {
+            items: application.registry
+                .listPrivileged()
+                .filter((x) => x.name.startsWith("market."))
+                .map((x) => x.name),
+        };
+    });
+    app.get("/v1/jobs", async (q, r) => {
+        if (!guard(q, r, "agent:write"))
+            return;
+        const db = new DatabaseSync(config.paths.jobs);
+        try {
+            const exists = db
+                .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'")
+                .get();
+            return {
+                items: exists
+                    ? db
+                        .prepare("SELECT id,type,status,scheduled_at scheduledAt,attempt_count attemptCount,max_attempts maxAttempts FROM jobs ORDER BY created_at DESC LIMIT 100")
+                        .all()
+                    : [],
+            };
+        }
+        finally {
+            db.close();
+        }
+    });
+    app.post("/v1/simulate", async (q, r) => {
+        if (!guard(q, r, "simulation:invoke"))
+            return;
+        const result = await application.registry.invoke("simulation.transaction", q.body ?? {}, {
+            capabilities: [TRADING_CAPABILITIES.ORDER_SIMULATE],
+            invocationId: randomUUID(),
+        });
+        return r
+            .code(!result.ok && result.error.code === "UNAVAILABLE" ? 503 : 200)
+            .send(result);
+    });
+    app.post("/v1/runs", async (q, r) => {
+        if (!guard(q, r, "agent:write"))
+            return;
+        const b = q.body;
+        if (!b?.sessionId || !b.input)
+            return r.code(400).send({ error: { code: "VALIDATION_ERROR" } });
+        const key = String(q.headers["idempotency-key"] ?? ""), old = key
+            ? application.runs.idempotent(config.auth.tenantId, key)
+            : undefined;
+        if (old)
+            return r.code(202).send(pub(old));
+        const run = application.runs.create({
+            id: randomUUID(),
+            tenantId: config.auth.tenantId,
+            subject: "api",
+            sessionId: b.sessionId,
+            status: "running",
+            createdAt: Date.now(),
+            events: [],
+        }, key || undefined);
+        queueMicrotask(async () => {
+            // The runtime reports its outcome as a terminal event; a run that
+            // ends without one (or throws) is treated as failed.
+            let status = "failed";
+            try {
+                application.runs.emit(run.id, "run.started", {});
+                for await (const e of application.runtime.run({
+                    messages: [{ role: "user", content: b.input }],
+                })) {
+                    application.runs.emit(run.id, e.type, e);
+                    if (e.type === "run.completed")
+                        status = "completed";
+                    else if (e.type === "run.cancelled")
+                        status = "cancelled";
+                    else if (e.type === "run.failed")
+                        status = "failed";
+                }
+            }
+            catch {
+                status = "failed";
+            }
+            try {
+                application.runs.setStatus(run.id, status);
+            }
+            catch {
+                // The store may already be closed during shutdown.
+            }
+        });
+        return r.code(202).send(pub(run));
+    });
+    app.get("/v1/runs/:id", async (q, r) => {
+        if (!guard(q, r, "agent:read"))
+            return;
+        const x = application.runs.get(q.params.id, config.auth.tenantId);
+        return x ? pub(x) : r.code(404).send({ error: { code: "NOT_FOUND" } });
+    });
+    app.get("/v1/runs/:id/events", async (q, r) => {
+        if (!guard(q, r, "agent:read"))
+            return;
+        const x = application.runs.get(q.params.id, config.auth.tenantId);
+        if (!x)
+            return r.code(404).send({ error: { code: "NOT_FOUND" } });
+        const last = Number(q.headers["last-event-id"] ?? 0);
+        return r
+            .type("text/event-stream")
+            .header("cache-control", "no-cache")
+            .send(x.events
+            .filter((e) => e.id > last)
+            .map((e) => `id: ${e.id}\nevent: ${e.type}\ndata: ${JSON.stringify(e.data)}\n\n`)
+            .join(""));
+    });
+    app.post("/v1/chat", async (q, r) => guard(q, r, "agent:read")
+        ? r.code(503).send({ error: { code: "MODEL_UNAVAILABLE" } })
+        : undefined);
+    // The operator console, served by this daemon on this origin. It is mounted
+    // unconditionally and fails closed: with no API credential configured every
+    // /api route — the approvals decision above all — answers 401.
+    registerControlPlane(app, {
+        runtime: {
+            network: config.network,
+            // HOST ONLY. RPC URLs routinely carry an API key in the path or query,
+            // and this string is rendered in a browser.
+            rpcLabel: config.rpc ? new URL(config.rpc.url).host : "unconfigured",
+            // Provider and model id only. The endpoint URL is not shown: a hosted
+            // provider's base URL can carry a key in its path, exactly as an RPC
+            // URL can, and this string is rendered in a browser.
+            modelLabel: overrides.modelProvider?.id ??
+                (config.llm ? llmProviderId(config.llm) : "unconfigured"),
+            bootedAt: Date.now(),
+            walletAddress: application.control.walletAddress,
+            policy: application.control.policy,
+            kernel: () => application.control.kernel(),
+            balances: application.control.balances,
+            // Both are undefined without custody, and the console reports that as an
+            // absent source rather than as an empty list of strategies and a silent
+            // market. See `snapshotSources`.
+            strategies: application.control.strategies,
+            signals: application.control.signals,
+        },
+        auth: {
+            bearerToken: config.auth.bearerToken,
+            bearerTokenSha256: config.auth.bearerTokenSha256,
+            scopes: config.auth.scopes,
+        },
+    });
+    app.addHook("onClose", async () => application.stop());
+    return app;
+}
+function pub(r) {
+    return {
+        id: r.id,
+        sessionId: r.sessionId,
+        status: r.status,
+        createdAt: r.createdAt,
+    };
+}
+export async function main() {
+    const c = loadConfig(process.env), app = await createStandaloneServer(c);
+    await app.listen({ host: c.host, port: c.port });
+}
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+    void main();
